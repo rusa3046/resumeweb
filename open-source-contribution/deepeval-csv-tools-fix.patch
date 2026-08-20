@@ -1,0 +1,163 @@
+From d9083ee8d9990390e48edcd8edd95aaf11df674c Mon Sep 17 00:00:00 2001
+From: Aanya Rustogi <aanya.rustogi@gmail.com>
+Date: Thu, 20 Aug 2026 02:56:43 +0000
+Subject: [PATCH] fix(dataset): parse delimiter-separated tools columns in
+ add_goldens_from_csv_file
+
+---
+ deepeval/dataset/dataset.py                   | 28 +++++--
+ tests/test_core/test_datasets/test_dataset.py | 84 +++++++++++++++++++
+ 2 files changed, 106 insertions(+), 6 deletions(-)
+
+diff --git a/deepeval/dataset/dataset.py b/deepeval/dataset/dataset.py
+index 9e5bf42..aa5a74a 100644
+--- a/deepeval/dataset/dataset.py
++++ b/deepeval/dataset/dataset.py
+@@ -531,14 +531,26 @@ class EvaluationDataset:
+             df, expected_output_col_name, default=None
+         )
+ 
+-        def parse_tools(value, delimiter: str):
++        def parse_tools(value, delimiter: str, field: str):
+             if not value:
+                 return []
+             try:
+                 return [ToolCall(**tool) for tool in trimAndLoadJson(value)]
+-            except (ValueError, json.JSONDecodeError):
+-                # Fallback to simple split on delimiter
+-                return value.split(delimiter)
++            except (ValueError, json.JSONDecodeError) as e:
++                # A cell that opens like JSON but does not parse is malformed
++                # input, not a delimited list of tool names.
++                if value.lstrip().startswith(("[", "{")):
++                    raise ValueError(f"Error processing {field}: {e}")
++                # Otherwise the cell is a delimiter-separated list of tool
++                # names, which is what the *_col_delimiter arguments are for.
++                # ToolCall requires a name, so build one per entry.
++                return [
++                    ToolCall(name=name)
++                    for name in (
++                        part.strip() for part in value.split(delimiter)
++                    )
++                    if name
++                ]
+ 
+         contexts = _parse_column(
+             df,
+@@ -559,12 +571,16 @@ class EvaluationDataset:
+         tools_called = _parse_column(
+             df,
+             tools_called_col_name,
+-            lambda value: parse_tools(value, tools_called_col_delimiter),
++            lambda value: parse_tools(
++                value, tools_called_col_delimiter, "tools_called"
++            ),
+         )
+         expected_tools = _parse_column(
+             df,
+             expected_tools_col_name,
+-            lambda value: parse_tools(value, expected_tools_col_delimiter),
++            lambda value: parse_tools(
++                value, expected_tools_col_delimiter, "expected_tools"
++            ),
+         )
+ 
+         comments = get_column_data(df, comments_key_name)
+diff --git a/tests/test_core/test_datasets/test_dataset.py b/tests/test_core/test_datasets/test_dataset.py
+index 4ca1766..6184bc7 100644
+--- a/tests/test_core/test_datasets/test_dataset.py
++++ b/tests/test_core/test_datasets/test_dataset.py
+@@ -14,6 +14,90 @@ from deepeval.test_case import (
+ )
+ 
+ 
++class TestCsvToolsParsing:
++    def _write_csv(self, directory, cell, column="tools_called"):
++        path = os.path.join(directory, "goldens.csv")
++        with open(path, "w", encoding="utf-8", newline="") as f:
++            writer = csv.writer(f)
++            writer.writerow(["input", "actual_output", column])
++            writer.writerow(["input", "actual output", cell])
++        return path
++
++    def test_delimited_tool_names_are_parsed_into_tool_calls(self):
++        """A delimiter-separated tools column yields ToolCalls, not a crash."""
++        with tempfile.TemporaryDirectory() as tmpdir:
++            csv_path = self._write_csv(tmpdir, "get_weather;get_location")
++
++            dataset = EvaluationDataset()
++            dataset.add_goldens_from_csv_file(file_path=csv_path)
++
++            assert dataset.goldens[0].tools_called == [
++                ToolCall(name="get_weather"),
++                ToolCall(name="get_location"),
++            ]
++
++    def test_custom_delimiter_and_surrounding_whitespace(self):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            csv_path = self._write_csv(tmpdir, "get_weather, get_location")
++
++            dataset = EvaluationDataset()
++            dataset.add_goldens_from_csv_file(
++                file_path=csv_path, tools_called_col_delimiter=","
++            )
++
++            assert dataset.goldens[0].tools_called == [
++                ToolCall(name="get_weather"),
++                ToolCall(name="get_location"),
++            ]
++
++    def test_delimited_expected_tools_are_parsed_into_tool_calls(self):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            csv_path = self._write_csv(
++                tmpdir, "get_weather", column="expected_tools"
++            )
++
++            dataset = EvaluationDataset()
++            dataset.add_goldens_from_csv_file(file_path=csv_path)
++
++            assert dataset.goldens[0].expected_tools == [
++                ToolCall(name="get_weather")
++            ]
++
++    def test_json_tools_column_still_parses(self):
++        """The JSON form written by save_as keeps working."""
++        with tempfile.TemporaryDirectory() as tmpdir:
++            csv_path = self._write_csv(
++                tmpdir, json.dumps([{"name": "get_weather"}])
++            )
++
++            dataset = EvaluationDataset()
++            dataset.add_goldens_from_csv_file(file_path=csv_path)
++
++            assert dataset.goldens[0].tools_called == [
++                ToolCall(name="get_weather")
++            ]
++
++    def test_malformed_json_tools_column_raises_readable_error(self):
++        """A broken JSON cell reports the column, not a pydantic type error."""
++        with tempfile.TemporaryDirectory() as tmpdir:
++            csv_path = self._write_csv(tmpdir, '[{"name": "get_weather"}')
++
++            dataset = EvaluationDataset()
++            with pytest.raises(
++                ValueError, match="Error processing tools_called"
++            ):
++                dataset.add_goldens_from_csv_file(file_path=csv_path)
++
++    def test_empty_tools_column_yields_no_tool_calls(self):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            csv_path = self._write_csv(tmpdir, "")
++
++            dataset = EvaluationDataset()
++            dataset.add_goldens_from_csv_file(file_path=csv_path)
++
++            assert not dataset.goldens[0].tools_called
++
++
+ class TestSaveAndLoad:
+     def test_dataset_save_load_goldens(self):
+         """Load Goldens from both CSV and JSON and check their count and a sample field."""
+-- 
+2.43.0
+

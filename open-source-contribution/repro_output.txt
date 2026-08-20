@@ -1,0 +1,12 @@
+deepeval 4.1.8
+JSON cell (the form save_as writes)
+  -> OK: [ToolCall(
+    name="get_weather"
+)]
+
+delimiter-separated names (documented ';')
+  -> ValidationError: 2 validation errors for Golden
+
+single bare tool name
+  -> ValidationError: 1 validation error for Golden
+
