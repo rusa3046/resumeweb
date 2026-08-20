@@ -34,7 +34,7 @@ writes. That path still works and is covered by a test here.
 
 ## Reproduction
 
-`deepeval 4.1.8`, Python 3.11, and current `main`.
+`deepeval 4.1.8` on macOS/Python 3.10 and Linux/Python 3.11, and current `main`.
 
 ```csv
 input,actual_output,tools_called
